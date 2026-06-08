@@ -1,15 +1,60 @@
 import numpy as np
 from pathlib import Path
 
+
+# =========================================================
+# Project paths
+# =========================================================
+
+# If this file is inside src/config.py, PROJECT_DIR will be the project root.
+# If this file is in project_root/config.py, PROJECT_DIR will also be the project root.
+_CONFIG_FILE = Path(__file__).resolve()
+PROJECT_DIR = _CONFIG_FILE.parent.parent if _CONFIG_FILE.parent.name.lower() == "src" else _CONFIG_FILE.parent
+
+DATA_DIR = PROJECT_DIR / "data"
+MODEL_DIR = PROJECT_DIR / "model"
+OUTPUT_DIR = PROJECT_DIR / "outputs"
+APP_DIR = PROJECT_DIR / "app"
+
+RESNET_PATH = MODEL_DIR / "deeplabv3_resnet50_best.pth"
+VIT_PATH = MODEL_DIR / "segformer_b0_best.pth"
+
+
+# =========================================================
+# Dataset
+# =========================================================
+
 DATASET = "electraawais/cityscape-dataset"
 
-CITYSCAPES_CLASSES = ["road", "sidewalk", "building", "wall", "fence",
-                      "pole", "traffic light", "traffic sign", "vegetation",
-                      "terrain", "sky", "person", "rider", "car",
-                      "truck", "bus", "train", "motorcycle", "bicycle"]
-NUM_CLASSES = len(CITYSCAPES_CLASSES)
+CITYSCAPES_CLASSES = [
+    "road",
+    "sidewalk",
+    "building",
+    "wall",
+    "fence",
+    "pole",
+    "traffic light",
+    "traffic sign",
+    "vegetation",
+    "terrain",
+    "sky",
+    "person",
+    "rider",
+    "car",
+    "truck",
+    "bus",
+    "train",
+    "motorcycle",
+    "bicycle",
+]
 
+NUM_CLASSES = len(CITYSCAPES_CLASSES)
 IGNORE_INDEX = 255
+
+
+# =========================================================
+# Cityscapes labelId -> trainId mapping
+# =========================================================
 
 LABELID_TO_TRAINID = {
     0: 255,
@@ -46,8 +91,13 @@ LABELID_TO_TRAINID = {
     31: 16,   # train
     32: 17,   # motorcycle
     33: 18,   # bicycle
-    255: 255
+    255: 255,
 }
+
+
+# =========================================================
+# Visualization colors
+# =========================================================
 
 CITYSCAPES_COLORS = np.array([
     [128, 64, 128],    # road
@@ -71,25 +121,89 @@ CITYSCAPES_COLORS = np.array([
     [119, 11, 32],     # bicycle
 ], dtype=np.uint8)
 
+
+# =========================================================
+# Preprocessing
+# =========================================================
+
 IMAGE_HEIGHT = 512
 IMAGE_WIDTH = 512
 
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+# =========================================================
+# Training hyperparameters
+# =========================================================
+
 BATCH_SIZE = 2
-
 RANDOMSEED = 42
-
 EPOCHS = 10
 
-#DeepLabV3-ResNet50
 RESNET_LEARNING_RATE = 1e-4
-#ViT
 VIT_LEARNING_RATE = 5e-5
-
 WEIGHT_DECAY = 1e-4
 
 
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-MODEL_DIR = PROJECT_DIR / "model"
+# =========================================================
+# Model names
+# =========================================================
 
-RESNET_PATH = MODEL_DIR / "deeplabv3_resnet50_best.pth"
-VIT_PATH = MODEL_DIR / "segformer_b0_best.pth"
+RESNET_MODEL_NAME = "DeepLabV3-ResNet50"
+VIT_MODEL_NAME = "SegFormer-B0"
+
+
+# =========================================================
+# Collision warning / app config
+# =========================================================
+
+DANGER_CLASS_NAMES = [
+    "person",
+    "rider",
+    "car",
+    "truck",
+    "bus",
+    "motorcycle",
+    "bicycle",
+]
+
+DANGER_CLASS_IDS = [
+    CITYSCAPES_CLASSES.index(name)
+    for name in DANGER_CLASS_NAMES
+    if name in CITYSCAPES_CLASSES
+]
+
+# Risk thresholds based on ratio of danger-class pixels inside ROI.
+SAFE_RISK_THRESHOLD = 0.03
+WARNING_RISK_THRESHOLD = 0.10
+
+# Trapezoid ROI defaults.
+# Larger top_y ratio means the trapezoid starts lower, so ROI is shorter.
+ROI_TOP_Y_RATIO = 0.62
+ROI_BOTTOM_WIDTH_RATIO = 0.62
+ROI_TOP_WIDTH_RATIO = 0.30
+
+# App inference defaults.
+APP_DEFAULT_ALPHA = 0.45
+APP_INFERENCE_SIZE_OPTIONS = [256, 384, 512]
+APP_DEFAULT_INFERENCE_SIZE = 384
+
+APP_MAX_VIDEO_FRAMES = 300
+APP_FRAME_STRIDE = 3
+
+APP_VIDEO_MODES = [
+    "Both models side-by-side",
+    "ResNet only",
+    "SegFormer only",
+]
+
+
+# =========================================================
+# Utility
+# =========================================================
+
+def ensure_project_dirs():
+    """Create common project directories if they do not exist."""
+    for directory in [DATA_DIR, MODEL_DIR, OUTPUT_DIR, APP_DIR]:
+        directory.mkdir(parents=True, exist_ok=True)
