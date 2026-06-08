@@ -1,4 +1,5 @@
 import numpy as np
+from pathlib import Path
 
 DATASET = "electraawais/cityscape-dataset"
 
@@ -86,4 +87,9 @@ VIT_LEARNING_RATE = 5e-5
 
 WEIGHT_DECAY = 1e-4
 
-SAVE_PATH = '/content/drive/MyDrive/DL Project/Model/segformer_b0_best.pth'
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+MODEL_DIR = PROJECT_DIR / "model"
+
+RESNET_PATH = MODEL_DIR / "deeplabv3_resnet50_best.pth"
+VIT_PATH = MODEL_DIR / "segformer_b0_best.pth"
