@@ -1,0 +1,98 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python build / package files
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Data files
+data/raw/*
+data/processed/*
+data/warehouse/*
+
+# Keep empty data folders
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/warehouse/.gitkeep
+
+# Outputs
+outputs/cube/*
+outputs/reports/*
+outputs/figures/*
+
+# Keep empty output folders
+!outputs/cube/.gitkeep
+!outputs/reports/.gitkeep
+!outputs/figures/.gitkeep
+
+# DuckDB files
+*.duckdb
+*.duckdb.wal
+
+# Parquet / CSV generated files
+*.parquet
+*.csv
+
+# Model files
+models/*
+*.pkl
+*.joblib
+*.pth
+
+# Keep empty models folder
+!models/.gitkeep
+
+# Streamlit cache
+.streamlit/secrets.toml
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Mypy / type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff / lint cache
+.ruff_cache/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
