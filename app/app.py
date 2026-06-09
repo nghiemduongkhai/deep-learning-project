@@ -1,5 +1,9 @@
 import os
 import re
+import time
+import gc
+import shutil
+import subprocess
 import tempfile
 import importlib.util
 from collections import OrderedDict
@@ -101,6 +105,11 @@ APP_VIDEO_MODES = list(
         ["Both models side-by-side", "ResNet only", "SegFormer only"],
     )
 )
+
+APP_VIDEO_CODEC = str(getattr(cfg, "APP_VIDEO_CODEC", "avc1"))
+APP_VIDEO_FALLBACK_CODEC = str(getattr(cfg, "APP_VIDEO_FALLBACK_CODEC", "mp4v"))
+FFMPEG_PATH = str(getattr(cfg, "FFMPEG_PATH", "ffmpeg"))
+APP_ALLOW_MP4V_FALLBACK = bool(getattr(cfg, "APP_ALLOW_MP4V_FALLBACK", True))
 
 
 def resolve_checkpoint_path(config_attr: str, fallback_filename: str) -> Path:
@@ -228,14 +237,93 @@ def compute_collision_risk(
     return status, overlap_ratio, roi
 
 
-def draw_roi_on_image(image_rgb: np.ndarray, roi: np.ndarray) -> np.ndarray:
+def get_warning_color_bgr(status: str) -> tuple[int, int, int]:
+    """Return OpenCV BGR color for the warning trapezoid."""
+    status = str(status).upper()
+
+    if status == "SAFE":
+        return (0, 200, 0)      # green
+    if status == "WARNING":
+        return (0, 220, 255)    # yellow
+    return (0, 0, 255)          # red
+
+
+def draw_roi_on_image(
+    image_rgb: np.ndarray,
+    roi: np.ndarray,
+    status: str = "SAFE",
+    risk_score: float | None = None,
+    fill_alpha: float = 0.28,
+) -> np.ndarray:
+    """
+    Draw the warning trapezoid on an RGB image.
+
+    SAFE    -> green
+    WARNING -> yellow
+    DANGER  -> red
+    """
     output_bgr = cv2.cvtColor(image_rgb.copy(), cv2.COLOR_RGB2BGR)
+    roi_mask = roi.astype(np.uint8)
+
+    color = get_warning_color_bgr(status)
+
+    # Fill the ROI with a transparent warning color.
+    colored_layer = output_bgr.copy()
+    colored_layer[roi_mask == 1] = color
+    output_bgr = cv2.addWeighted(
+        colored_layer,
+        fill_alpha,
+        output_bgr,
+        1.0 - fill_alpha,
+        0,
+    )
+
+    # Draw a thick border around the trapezoid.
     contours, _ = cv2.findContours(
-        roi.astype(np.uint8),
+        roi_mask,
         cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_SIMPLE,
     )
-    cv2.drawContours(output_bgr, contours, -1, (0, 255, 255), 3)
+    cv2.drawContours(output_bgr, contours, -1, color, 4)
+
+    # Put a small label inside the trapezoid.
+    ys, xs = np.where(roi_mask == 1)
+    if len(xs) > 0 and len(ys) > 0:
+        label = str(status).upper()
+        if risk_score is not None:
+            label = f"{label} | risk={risk_score:.3f}"
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.75
+        thickness = 2
+        text_size, baseline = cv2.getTextSize(label, font, font_scale, thickness)
+        text_w, text_h = text_size
+
+        image_h, image_w = output_bgr.shape[:2]
+        center_x = int(np.mean(xs))
+        top_y = int(np.min(ys))
+
+        text_x = int(np.clip(center_x - text_w // 2, 10, max(10, image_w - text_w - 10)))
+        text_y = int(np.clip(top_y + text_h + 20, text_h + 10, image_h - 10))
+
+        cv2.rectangle(
+            output_bgr,
+            (text_x - 8, text_y - text_h - 8),
+            (text_x + text_w + 8, text_y + baseline + 8),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.putText(
+            output_bgr,
+            label,
+            (text_x, text_y),
+            font,
+            font_scale,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
     return cv2.cvtColor(output_bgr, cv2.COLOR_BGR2RGB)
 
 
@@ -526,7 +614,7 @@ def process_image(
 
     mask_color = decode_segmentation_mask(pred_mask)
     overlay = overlay_mask(image_rgb, pred_mask, alpha=alpha)
-    overlay_roi = draw_roi_on_image(overlay, roi)
+    overlay_roi = draw_roi_on_image(overlay, roi, status=status, risk_score=risk_score)
     final_image = add_status_text(overlay_roi, display_name, status, risk_score)
 
     return {
@@ -603,6 +691,177 @@ def process_two_models_image(
 # Video
 # =========================================================
 
+def safe_remove_file(file_path: str, retries: int = 8, delay: float = 0.25):
+    """Remove temp files safely on Windows without crashing Streamlit."""
+    if not file_path:
+        return
+
+    for _ in range(retries):
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            return
+        except PermissionError:
+            gc.collect()
+            time.sleep(delay)
+        except FileNotFoundError:
+            return
+
+    # Do not crash only because a temporary video is still locked by Windows.
+    try:
+        if os.path.exists(file_path):
+            st.warning(f"Temporary file is still locked and was not deleted: {file_path}")
+    except Exception:
+        pass
+
+
+def find_ffmpeg_executable():
+    """
+    Find ffmpeg without requiring manual Windows PATH setup.
+
+    Search order:
+    1. FFMPEG_PATH from config.py
+    2. ffmpeg available in PATH
+    3. imageio-ffmpeg package installed by pip
+    """
+    candidates = []
+
+    if FFMPEG_PATH:
+        candidates.append(FFMPEG_PATH)
+
+    candidates.append("ffmpeg")
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+
+        candidate_path = Path(candidate)
+        if candidate_path.exists():
+            return str(candidate_path)
+
+        found = shutil.which(candidate)
+        if found:
+            return found
+
+    try:
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if ffmpeg_exe and Path(ffmpeg_exe).exists():
+            return ffmpeg_exe
+    except Exception:
+        pass
+
+    return None
+
+
+def open_video_writer(video_path: str, codec: str, fps: float, frame_size: tuple[int, int]):
+    fourcc = cv2.VideoWriter_fourcc(*codec)
+    writer = cv2.VideoWriter(video_path, fourcc, fps, frame_size)
+    if writer.isOpened():
+        return writer
+    writer.release()
+    return None
+
+
+def reencode_to_h264(input_path: str, output_path: str, ffmpeg_exe: str):
+    """Re-encode a video to browser-compatible H.264 MP4."""
+    command = [
+        ffmpeg_exe,
+        "-y",
+        "-i",
+        input_path,
+        "-vcodec",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
+
+    subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def create_browser_compatible_video_writer(
+    output_video_path: str,
+    output_fps: float,
+    frame_size: tuple[int, int],
+):
+    """
+    Prefer direct H.264 writing. If OpenCV cannot write H.264 on Windows,
+    write a temporary mp4v video and re-encode with ffmpeg/imageio-ffmpeg.
+    """
+    writer = open_video_writer(
+        video_path=output_video_path,
+        codec=APP_VIDEO_CODEC,
+        fps=output_fps,
+        frame_size=frame_size,
+    )
+
+    if writer is not None:
+        return {
+            "writer": writer,
+            "write_path": output_video_path,
+            "needs_reencode": False,
+            "browser_compatible": True,
+            "codec_used": APP_VIDEO_CODEC,
+            "ffmpeg_exe": None,
+            "warning": None,
+        }
+
+    raw_path = str(Path(output_video_path).with_name(Path(output_video_path).stem + "_raw.mp4"))
+    fallback_writer = open_video_writer(
+        video_path=raw_path,
+        codec=APP_VIDEO_FALLBACK_CODEC,
+        fps=output_fps,
+        frame_size=frame_size,
+    )
+
+    if fallback_writer is None:
+        raise RuntimeError(
+            f"Cannot create video writer with codec {APP_VIDEO_CODEC} or "
+            f"fallback codec {APP_VIDEO_FALLBACK_CODEC}."
+        )
+
+    ffmpeg_exe = find_ffmpeg_executable()
+    if ffmpeg_exe is not None:
+        return {
+            "writer": fallback_writer,
+            "write_path": raw_path,
+            "needs_reencode": True,
+            "browser_compatible": True,
+            "codec_used": APP_VIDEO_FALLBACK_CODEC,
+            "ffmpeg_exe": ffmpeg_exe,
+            "warning": None,
+        }
+
+    if not APP_ALLOW_MP4V_FALLBACK:
+        fallback_writer.release()
+        safe_remove_file(raw_path)
+        raise RuntimeError(
+            "Codec avc1/H.264 is not available in this OpenCV build, and ffmpeg "
+            "was not found. Install imageio-ffmpeg with: pip install imageio-ffmpeg"
+        )
+
+    return {
+        "writer": fallback_writer,
+        "write_path": raw_path,
+        "needs_reencode": False,
+        "browser_compatible": False,
+        "codec_used": APP_VIDEO_FALLBACK_CODEC,
+        "ffmpeg_exe": None,
+        "warning": (
+            "H.264 is not available and ffmpeg was not found. The app exported "
+            "an mp4v MP4 file. Download may work, but browser preview may not play."
+        ),
+    }
+
+
 def process_video_compare(
     resnet_model,
     segformer_model,
@@ -619,112 +878,166 @@ def process_video_compare(
     roi_top_width: float,
     video_mode: str,
 ):
-    cap = cv2.VideoCapture(input_video_path)
-
-    if not cap.isOpened():
-        raise RuntimeError("Cannot open uploaded video.")
-
-    input_fps = cap.get(cv2.CAP_PROP_FPS)
-    if input_fps <= 0 or np.isnan(input_fps):
-        input_fps = 20
-
-    output_fps = max(input_fps / max(frame_stride, 1), 1)
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    output_width = width * 2 if video_mode == "Both models side-by-side" else width
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_video_path, fourcc, output_fps, (output_width, height))
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0:
-        total_frames = max_input_frames
-
-    target_input_frames = min(total_frames, max_input_frames)
+    cap = None
+    writer = None
+    writer_info = None
+    progress = None
+    status_box = None
 
     read_count = 0
     inferred_count = 0
     written_count = 0
+    input_fps = 20
+    output_fps = 20
+    output_width = 0
+    height = 0
 
-    progress = st.progress(0)
-    status_box = st.empty()
+    try:
+        cap = cv2.VideoCapture(input_video_path)
 
-    while read_count < target_input_frames:
-        ret, frame_bgr = cap.read()
-        if not ret:
-            break
+        if not cap.isOpened():
+            raise RuntimeError("Cannot open uploaded video.")
 
-        if read_count % frame_stride == 0:
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        input_fps = cap.get(cv2.CAP_PROP_FPS)
+        if input_fps <= 0 or np.isnan(input_fps):
+            input_fps = 20
 
-            if video_mode == "ResNet only":
-                result = process_image(
-                    model=resnet_model,
-                    model_name=RESNET_MODEL_NAME,
-                    display_name="ResNet",
-                    image_rgb=frame_rgb,
-                    device=device,
-                    alpha=alpha,
-                    infer_height=infer_height,
-                    infer_width=infer_width,
-                    roi_top_y=roi_top_y,
-                    roi_bottom_width=roi_bottom_width,
-                    roi_top_width=roi_top_width,
+        output_fps = max(input_fps / max(frame_stride, 1), 1)
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        if width <= 0 or height <= 0:
+            raise RuntimeError("Cannot read video width/height from uploaded video.")
+
+        output_width = width * 2 if video_mode == "Both models side-by-side" else width
+        frame_size = (output_width, height)
+
+        writer_info = create_browser_compatible_video_writer(
+            output_video_path=output_video_path,
+            output_fps=output_fps,
+            frame_size=frame_size,
+        )
+        writer = writer_info["writer"]
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            total_frames = max_input_frames
+
+        target_input_frames = min(total_frames, max_input_frames)
+
+        progress = st.progress(0)
+        status_box = st.empty()
+
+        while read_count < target_input_frames:
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
+
+            if read_count % frame_stride == 0:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+                if video_mode == "ResNet only":
+                    result = process_image(
+                        model=resnet_model,
+                        model_name=RESNET_MODEL_NAME,
+                        display_name="ResNet",
+                        image_rgb=frame_rgb,
+                        device=device,
+                        alpha=alpha,
+                        infer_height=infer_height,
+                        infer_width=infer_width,
+                        roi_top_y=roi_top_y,
+                        roi_bottom_width=roi_bottom_width,
+                        roi_top_width=roi_top_width,
+                    )
+                    final_rgb = add_panel_title(result["final_image"], RESNET_MODEL_NAME)
+
+                elif video_mode == "SegFormer only":
+                    result = process_image(
+                        model=segformer_model,
+                        model_name=VIT_MODEL_NAME,
+                        display_name="SegFormer",
+                        image_rgb=frame_rgb,
+                        device=device,
+                        alpha=alpha,
+                        infer_height=infer_height,
+                        infer_width=infer_width,
+                        roi_top_y=roi_top_y,
+                        roi_bottom_width=roi_bottom_width,
+                        roi_top_width=roi_top_width,
+                    )
+                    final_rgb = add_panel_title(result["final_image"], VIT_MODEL_NAME)
+
+                else:
+                    _, _, final_rgb = process_two_models_image(
+                        resnet_model=resnet_model,
+                        segformer_model=segformer_model,
+                        image_rgb=frame_rgb,
+                        device=device,
+                        alpha=alpha,
+                        infer_height=infer_height,
+                        infer_width=infer_width,
+                        roi_top_y=roi_top_y,
+                        roi_bottom_width=roi_bottom_width,
+                        roi_top_width=roi_top_width,
+                    )
+
+                final_bgr = cv2.cvtColor(final_rgb, cv2.COLOR_RGB2BGR)
+                writer.write(final_bgr)
+
+                inferred_count += 1
+                written_count += 1
+
+            read_count += 1
+
+            if read_count % 10 == 0 or read_count == target_input_frames:
+                progress.progress(min(read_count / max(target_input_frames, 1), 1.0))
+                status_box.write(
+                    f"Read {read_count}/{target_input_frames} frames | "
+                    f"Inferred {inferred_count} frames"
                 )
-                final_rgb = add_panel_title(result["final_image"], RESNET_MODEL_NAME)
 
-            elif video_mode == "SegFormer only":
-                result = process_image(
-                    model=segformer_model,
-                    model_name=VIT_MODEL_NAME,
-                    display_name="SegFormer",
-                    image_rgb=frame_rgb,
-                    device=device,
-                    alpha=alpha,
-                    infer_height=infer_height,
-                    infer_width=infer_width,
-                    roi_top_y=roi_top_y,
-                    roi_bottom_width=roi_bottom_width,
-                    roi_top_width=roi_top_width,
-                )
-                final_rgb = add_panel_title(result["final_image"], VIT_MODEL_NAME)
+    finally:
+        if cap is not None:
+            cap.release()
 
-            else:
-                _, _, final_rgb = process_two_models_image(
-                    resnet_model=resnet_model,
-                    segformer_model=segformer_model,
-                    image_rgb=frame_rgb,
-                    device=device,
-                    alpha=alpha,
-                    infer_height=infer_height,
-                    infer_width=infer_width,
-                    roi_top_y=roi_top_y,
-                    roi_bottom_width=roi_bottom_width,
-                    roi_top_width=roi_top_width,
-                )
+        if writer is not None:
+            writer.release()
 
-            final_bgr = cv2.cvtColor(final_rgb, cv2.COLOR_RGB2BGR)
-            writer.write(final_bgr)
+        gc.collect()
 
-            inferred_count += 1
-            written_count += 1
+        if progress is not None:
+            progress.empty()
 
-        read_count += 1
+        if status_box is not None:
+            status_box.empty()
 
-        if read_count % 10 == 0 or read_count == target_input_frames:
-            progress.progress(min(read_count / max(target_input_frames, 1), 1.0))
-            status_box.write(
-                f"Read {read_count}/{target_input_frames} frames | "
-                f"Inferred {inferred_count} frames"
+    browser_compatible = True
+    codec_used = None
+    warning = None
+    reencoded = False
+    raw_write_path = None
+
+    if writer_info is not None:
+        browser_compatible = bool(writer_info["browser_compatible"])
+        codec_used = writer_info["codec_used"]
+        warning = writer_info["warning"]
+        raw_write_path = writer_info["write_path"]
+
+        if writer_info["needs_reencode"]:
+            reencoded_path = str(Path(output_video_path).with_name(Path(output_video_path).stem + "_h264.mp4"))
+            reencode_to_h264(
+                input_path=writer_info["write_path"],
+                output_path=reencoded_path,
+                ffmpeg_exe=writer_info["ffmpeg_exe"],
             )
+            os.replace(reencoded_path, output_video_path)
+            safe_remove_file(writer_info["write_path"])
+            reencoded = True
 
-    cap.release()
-    writer.release()
-
-    progress.empty()
-    status_box.empty()
+        elif writer_info["write_path"] != output_video_path:
+            os.replace(writer_info["write_path"], output_video_path)
 
     return {
         "input_frames_read": read_count,
@@ -736,6 +1049,11 @@ def process_video_compare(
         "height": height,
         "frame_stride": frame_stride,
         "video_mode": video_mode,
+        "codec_used": codec_used,
+        "reencoded_to_h264": reencoded,
+        "browser_compatible": browser_compatible,
+        "raw_write_path": raw_write_path,
+        "warning": warning,
     }
 
 
@@ -969,16 +1287,27 @@ with tab_video:
                 st.success("Video processed successfully.")
                 st.write(info)
 
-                st.video(output_video_path)
-
                 with open(output_video_path, "rb") as file:
-                    st.download_button(
-                        label="Download processed video",
-                        data=file,
-                        file_name="processed_two_models_collision_warning.mp4",
-                        mime="video/mp4",
+                    output_video_bytes = file.read()
+
+                if info.get("warning"):
+                    st.warning(info["warning"])
+
+                if info.get("browser_compatible", True):
+                    st.video(output_video_bytes)
+                else:
+                    st.info(
+                        "Preview trên trình duyệt có thể không phát vì video không phải H.264. "
+                        "Bạn hãy tải file về và mở bằng VLC hoặc trình phát video trên máy."
                     )
 
+                st.download_button(
+                    label="Download processed video",
+                    data=output_video_bytes,
+                    file_name="processed_two_models_collision_warning.mp4",
+                    mime="video/mp4",
+                )
+
             finally:
-                if os.path.exists(input_video_path):
-                    os.remove(input_video_path)
+                safe_remove_file(input_video_path)
+                safe_remove_file(output_video_path)

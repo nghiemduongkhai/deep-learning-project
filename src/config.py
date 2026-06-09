@@ -198,6 +198,14 @@ APP_VIDEO_MODES = [
     "SegFormer only",
 ]
 
+# Video encoding settings.
+# On Windows, OpenCV may not support H.264/avc1 directly.
+# Install imageio-ffmpeg with: pip install imageio-ffmpeg
+APP_VIDEO_CODEC = "avc1"
+APP_VIDEO_FALLBACK_CODEC = "mp4v"
+FFMPEG_PATH = "ffmpeg"
+APP_ALLOW_MP4V_FALLBACK = True
+
 
 # =========================================================
 # Utility

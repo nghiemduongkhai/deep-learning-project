@@ -24,6 +24,7 @@ ENV/
 # VS Code / IDE
 .vscode/
 .idea/
+__pycache__/
 
 # OS generated files
 .DS_Store
@@ -68,7 +69,7 @@ outputs/figures/*
 *.csv
 
 # Model files
-models/*
+model/*
 *.pkl
 *.joblib
 *.pth
